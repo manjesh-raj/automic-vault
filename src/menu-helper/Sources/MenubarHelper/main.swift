@@ -134,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var liveSecretUseTimer: Timer?
     private var baseStatusImage: NSImage?
     private var doctorReportCount = 0
+    private var reblessingCount = 0
     private var outdatedToolCount = 0
     private var latestToolStatus: ToolStatusSnapshot?
     private var toolAttentionGeneration = 0
@@ -1097,27 +1098,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setDoctorStatus(count: Int) {
         doctorReportCount = count
         refreshStatusImage()
-        guard !isStatusMenuOpen else { return }
-        guard let title = doctorStatusTitle(count: count) else {
-            doctorStatusItem.isHidden = true
-            return
-        }
-        setStatusMenuItemTitle(title, on: doctorStatusItem)
-        doctorStatusItem.isHidden = false
+        refreshToolAttentionMenuItems()
     }
 
     private func setReblessingStatus(count: Int) {
-        guard !isStatusMenuOpen else { return }
-        reblessingStatusItem.title = reblessingStatusTitle(count: count) ?? ""
-        reblessingStatusItem.isHidden = count == 0
+        reblessingCount = count
+        refreshToolAttentionMenuItems()
     }
 
     private func setOutdatedToolsStatus(count: Int) {
         outdatedToolCount = count
         refreshStatusImage()
+        refreshToolAttentionMenuItems()
+    }
+
+    private func refreshToolAttentionMenuItems() {
         guard !isStatusMenuOpen else { return }
-        outdatedToolsStatusItem.title = outdatedToolsStatusTitle(count: count) ?? ""
-        outdatedToolsStatusItem.isHidden = count == 0
+        setStatusMenuItemTitle(doctorStatusTitle(count: doctorReportCount) ?? "", on: doctorStatusItem)
+        doctorStatusItem.isHidden = doctorReportCount == 0
+        reblessingStatusItem.title = reblessingStatusTitle(count: reblessingCount) ?? ""
+        reblessingStatusItem.isHidden = reblessingCount == 0
+        outdatedToolsStatusItem.title = outdatedToolsStatusTitle(count: outdatedToolCount) ?? ""
+        outdatedToolsStatusItem.isHidden = outdatedToolCount == 0
     }
 
     @objc private func dashboardReloaded(_ notification: Notification) {
@@ -1573,9 +1575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             temporaryAccessGrantStripFrame = nil
             return
         }
-        let autoCollapse = UserDefaults.standard.bool(
-            forKey: autoCollapseTemporaryAccessGrantStripDefaultsKey
-        )
+        let autoCollapse = (try? loadPresentationSetting(.autoCollapseGrantStrip)) == "true"
         if !autoCollapse {
             temporaryAccessGrantCollapseWorkItem?.cancel()
             temporaryAccessGrantCollapseWorkItem = nil
@@ -1645,9 +1645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.temporaryAccessGrantCollapseWorkItem = nil
-                guard UserDefaults.standard.bool(
-                    forKey: autoCollapseTemporaryAccessGrantStripDefaultsKey
-                ), !self.temporaryAccessGrantSnapshots.isEmpty
+                guard (try? loadPresentationSetting(.autoCollapseGrantStrip)) == "true", !self.temporaryAccessGrantSnapshots.isEmpty
                 else { return }
                 self.collapseTemporaryAccessGrantStrip()
             }
@@ -1752,6 +1750,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
+        // Status arriving during menu tracking must be visible on the next opening.
+        let wasStartingUp = isStartingUp
+        isStartingUp = false
+        menuWillOpen(menu)
+        setDoctorStatus(count: 2)
+        setReblessingStatus(count: 1)
+        NotificationCenter.default.post(name: dashboardDidReload,
+                                        object: DashboardModel(snapshot: attentionSnapshot))
+        guard controller.rootView.model.toolUpdates == packages,
+              outdatedToolsStatusItem.isHidden else { return false }
+        menuDidClose(menu)
+        menuWillOpen(menu)
+        guard !outdatedToolsStatusItem.isHidden,
+              outdatedToolsStatusItem.title == "1 Outdated Hardened Tool" else {
+            print("Menu lost Tool status published while it was open")
+            return false
+        }
+        setDoctorStatus(count: 2)
+        setReblessingStatus(count: 1)
+        menuDidClose(menu)
+        guard !doctorStatusItem.isHidden, !reblessingStatusItem.isHidden else {
+            print("Menu lost attention counts published while it was open")
+            return false
+        }
+        menuWillOpen(menu)
+        publishToolStatus(ToolStatusSnapshot(snapshot: .empty))
+        setReblessingStatus(count: 0)
+        guard !outdatedToolsStatusItem.isHidden, !doctorStatusItem.isHidden,
+              !reblessingStatusItem.isHidden else { return false }
+        menuDidClose(menu)
+        guard outdatedToolsStatusItem.isHidden, doctorStatusItem.isHidden,
+              reblessingStatusItem.isHidden else {
+            print("Menu retained resolved attention counts after closing")
+            return false
+        }
+        isStartingUp = wasStartingUp
+
         setDoctorStatus(count: 1)
         guard statusOutlineColor == .systemOrange else { return false }
         setDoctorStatus(count: 0)
@@ -1787,8 +1822,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               brandImage(outline: .systemRed)?.isTemplate == false else { return false }
 
         setOutdatedToolsStatus(count: 2)
-        guard outdatedToolsStatusItem.title == "2 outdated hardened tools",
-              outdatedToolsStatusTitle(count: 1) == "1 outdated hardened tool",
+        guard outdatedToolsStatusItem.title == "2 Outdated Hardened Tools",
+              outdatedToolsStatusTitle(count: 1) == "1 Outdated Hardened Tool",
               outdatedToolsStatusTitle(count: 0) == nil else { return false }
         setDoctorStatus(count: 2)
         setReblessingStatus(count: 1)
@@ -1888,6 +1923,7 @@ private func scanDetectorGroup(_ detectors: Set<String>) -> Set<String> {
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         if !isStartingUp, !isUpdating {
+            refreshToolAttentionMenuItems()
             refreshTemporaryDenials()
             refreshAutoApprovalMenuItems()
             refreshTemporaryAccessGrantMenuItems()
@@ -1900,6 +1936,8 @@ extension AppDelegate: NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         isStatusMenuOpen = false
         guard !isStartingUp, !isUpdating else { return }
+        // Replay cached status before another asynchronous check can finish.
+        refreshToolAttentionMenuItems()
         refreshTemporaryDenials()
         refreshAutoApprovalMenuItems()
         refreshTemporaryAccessGrantMenuItems()
@@ -2102,9 +2140,7 @@ private func shouldShowAutomaticAccessToast(_ record: AccessRequestRecord) -> Bo
         && record.reason != "Denied by two-minute Temporary Launcher Denial"
 }
 
-private func automaticApprovalFeedback(rawValue: String? = UserDefaults.standard.string(
-    forKey: automaticApprovalFeedbackDefaultsKey
-)) -> AutomaticApprovalFeedback {
+private func automaticApprovalFeedback(rawValue: String? = try? loadPresentationSetting(.feedback)) -> AutomaticApprovalFeedback {
     rawValue.flatMap(AutomaticApprovalFeedback.init(rawValue:)) ?? .notification
 }
 
@@ -2283,8 +2319,8 @@ private func boundedScanDelay(
 private func outdatedToolsStatusTitle(count: Int) -> String? {
     guard count > 0 else { return nil }
     return count == 1
-        ? String(localized: "1 outdated hardened tool")
-        : String(localized: "\(count) outdated hardened tools")
+        ? String(localized: "1 Outdated Hardened Tool")
+        : String(localized: "\(count) Outdated Hardened Tools")
 }
 
 private func doctorStatusTitle(count: Int) -> String? {
@@ -3966,6 +4002,7 @@ private let registryHelperProtocolVersion: UInt64 = 3
 
 private enum MetadataDisclosure {
     case secretNames(globalOnly: Bool)
+    case secretSources
     case authorizationHistory(since: Date?)
 }
 
@@ -3995,7 +4032,8 @@ private func metadataDisclosureHasAutomaticAccess(
     secretNameAccessApps: [BlessedScriptLauncher] = loadSecretNameAccessApps(),
     authorizationHistoryAccessApps: [BlessedScriptLauncher] = loadAuthorizationHistoryAccessApps()
 ) -> Bool {
-    let allowedApps = switch kind {
+    let allowedApps: [BlessedScriptLauncher] = switch kind {
+    case .secretSources: []
     case .secretNames: secretNameAccessApps
     case .authorizationHistory: authorizationHistoryAccessApps
     }
@@ -4474,7 +4512,12 @@ private final class ApprovalServer: @unchecked Sendable {
             handleTerraformSave(message, on: peer, cancellation: cancellation, caller: mutationCaller)
         case .terraformDelete where isTrustedAvCaller(path: callerPath, signing: signing):
             handleTerraformDelete(message, on: peer, cancellation: cancellation, caller: mutationCaller)
-        case .list where isTrustedAvCaller(path: callerPath, signing: signing):
+        case .settingsList where isTrustedAvCaller(path: callerPath, signing: signing),
+             .settingsGet where isTrustedAvCaller(path: callerPath, signing: signing),
+             .settingsSet where isTrustedAvCaller(path: callerPath, signing: signing):
+            handleSettings(message, on: peer, cancellation: cancellation, caller: mutationCaller, operation: op)
+        case .list where isTrustedAvCaller(path: callerPath, signing: signing),
+             .listSources where isTrustedAvCaller(path: callerPath, signing: signing):
             handleMetadataDisclosure(
                 message,
                 on: peer,
@@ -4483,7 +4526,8 @@ private final class ApprovalServer: @unchecked Sendable {
                 identity: identity,
                 callerPath: callerPath,
                 signing: signing,
-                kind: .secretNames(globalOnly: xpc_dictionary_get_bool(message, "global_only"))
+                kind: op == .listSources ? .secretSources
+                    : .secretNames(globalOnly: xpc_dictionary_get_bool(message, "global_only"))
             )
         case .history where isTrustedAvCaller(path: callerPath, signing: signing),
              .historyWindow where isTrustedAvCaller(path: callerPath, signing: signing),
@@ -4559,6 +4603,91 @@ private final class ApprovalServer: @unchecked Sendable {
         }
     }
 
+    private func handleSettings(
+        _ message: xpc_object_t, on peer: xpc_connection_t,
+        cancellation: ApprovalCancellation, caller: MutationCaller, operation: ApprovalServiceOperation
+    ) {
+        let key = xpc_dictionary_get_string(message, "key").map(String.init(cString:))
+        let value = xpc_dictionary_get_string(message, "value").map(String.init(cString:))
+        let setting = key.flatMap(PresentationSetting.init(rawValue:))
+        guard presentationSettingsRequestIsValid(operation: operation, key: key, value: value) else {
+            reply(peer, to: message, ok: false, error: "unsupported setting, value, or settings operation")
+            return
+        }
+        let cwd = xpc_dictionary_get_string(message, "cwd").map(String.init(cString:))
+        guard operation != .settingsSet || cwd != nil else {
+            reply(peer, to: message, ok: false, error: "settings change is missing its working directory")
+            return
+        }
+        let launchers = operation == .settingsSet ? launcherIdentities(for: caller.identity) : []
+        let fallback = launcherFallbackPath(for: caller.identity) ?? caller.path
+        let launcher = executionOrigin(among: launchers, callerPID: caller.pid, ancestorFallbackPath: fallback)
+        Task { @MainActor in
+            do {
+                guard !cancellation.isCanceled else { return }
+                if operation == .settingsSet, let setting, let value {
+                    let old = try loadPresentationSetting(setting)
+                    let request = ApprovalRequest(
+                        op: "settings-set", keys: [], target: caller.path,
+                        args: ["settings", "set", setting.rawValue, value], cwd: cwd!,
+                        replaceExistingEnv: false, allowMissingKeys: false, envConflicts: [],
+                        shebangScript: nil, scriptData: nil, tool: "av",
+                        title: "Change \(setting.title)?", detail: setting.changeDetail(from: old, to: value)
+                    )
+                    if setting.requiresApproval && old != value {
+                        guard self.canRequestHumanApproval() else { throw AppError("User Approval is unavailable") }
+                        self.sendEvent(humanApprovalRequiredEvent, to: peer)
+                        let decision = await showApprovalAlert(
+                            request: request, callerPath: caller.path, pid: caller.pid, signing: caller.signing,
+                            scriptApproval: nil, launcher: launcher, denialLaunchers: launchers,
+                            launcherFallbackPath: fallback, automaticApprovalExplanation: nil,
+                            cancellation: cancellation
+                        )
+                        guard decision == .approved else {
+                            _ = self.onAccessRequest(accessRequestRecord(
+                                request: request, callerPath: caller.path, decision: "Denied",
+                                approvalSource: "Manual", reason: "Settings change was not approved", launcher: launcher
+                            ))
+                            throw AppError("Settings change was not approved")
+                        }
+                        guard self.canRequestHumanApproval() else { throw AppError("User Approval is unavailable") }
+                    }
+                    var current = AVProcessIdentity()
+                    guard !cancellation.isCanceled,
+                          av_process_identity(caller.pid, &current), sameProcessIdentity(caller.identity, current),
+                          let liveSigning = liveSigningInfo(pid: caller.pid),
+                          liveSigning.identifier == "com.automicvault.av",
+                          liveSigning.isDeveloperID, liveSigning.runtimeProtection == .hardened,
+                          liveSigning.teamIdentifier == caller.signing.teamIdentifier,
+                          liveSigning.mainExecutable == caller.path,
+                          launcherBundleIntegrityError(for: current) == nil else {
+                        throw AppError("Settings requester changed or exited")
+                    }
+                    try commitPresentationSetting(setting, value: value, expected: old,
+                        read: { try loadPresentationSetting(setting) },
+                        record: {
+                            self.onAccessRequest(accessRequestRecord(
+                                request: request, callerPath: caller.path, decision: "Approved",
+                                approvalSource: "Manual", reason: "Approved settings change", launcher: launcher
+                            ))
+                        },
+                        write: {
+                            guard !cancellation.isCanceled else { throw AppError("Settings change canceled") }
+                            try savePresentationSetting(setting, value: $0)
+                        }
+                    )
+                    NotificationCenter.default.post(name: temporaryAccessGrantStripPresentationDidChange, object: nil)
+                }
+                let settings = setting.map { [$0] } ?? PresentationSetting.allCases
+                let snapshots = try settings.map { PresentationSettingSnapshot($0, value: try loadPresentationSetting($0)) }
+                let data = try JSONEncoder().encode(snapshots)
+                self.reply(peer, to: message, ok: true, error: nil, value: String(decoding: data, as: UTF8.self))
+            } catch {
+                self.reply(peer, to: message, ok: false, error: error.localizedDescription)
+            }
+        }
+    }
+
     private func handleMetadataDisclosure(
         _ message: xpc_object_t,
         on peer: xpc_connection_t,
@@ -4571,6 +4700,12 @@ private final class ApprovalServer: @unchecked Sendable {
     ) {
         let cwd = xpc_dictionary_get_string(message, "cwd")
             .map { String(cString: $0) } ?? ""
+        if case .secretSources = kind {
+            guard !cwd.isEmpty, (try? physicalDirectoryAncestors(cwd)) != nil else {
+                reply(peer, to: message, ok: false, error: "invalid selection directory")
+                return
+            }
+        }
         var launchers = launcherIdentities(for: identity)
         let ancestorFallbackPath = launcherFallbackPath(for: identity)
         if launchers.isEmpty, let caller = launcherIdentity(pid: pid, identity: identity) {
@@ -4590,6 +4725,12 @@ private final class ApprovalServer: @unchecked Sendable {
                 ? "Secret values will remain hidden. av will receive every saved Global Value name."
                 : "Secret values will remain hidden. av will receive every saved Secret Name.",
             ["list"]
+        )
+        case .secretSources: (
+            "list-sources",
+            "List Secret Value sources?",
+            "av will receive saved Secret Names and the Global Value or matched Project Directory selected for this directory. Secret bytes will remain hidden. This preview does not authorize Secret Use or verify Value availability.",
+            ["list", "--project-directory=\(cwd)"]
         )
         case .authorizationHistory(let since): (
             "history",
@@ -4734,6 +4875,28 @@ private final class ApprovalServer: @unchecked Sendable {
         if denyRequestIfNeeded(request, signing: signing,
                                launchers: launchers,
                                callerPath: callerPath, peer: peer, message: message) { return }
+        var sourceValue: String?
+        if case .secretSources = kind {
+            do {
+                let secrets: [StoredSecret]
+                switch loadStoredSecretsResult() {
+                case .success(let inventory): secrets = inventory
+                case .failure(let status): throw SecretValueCustodyError.inventoryUnavailable(status)
+                }
+                sourceValue = String(decoding: try JSONEncoder().encode(
+                    secretSourcePreview(secrets: secrets, cwd: request.cwd)
+                ), as: UTF8.self)
+            } catch {
+                _ = onAccessRequest(accessRequestRecord(
+                    request: request, callerPath: callerPath, decision: "Failed",
+                    approvalSource: approvalSource,
+                    reason: "Secret source preview unavailable: \(error.localizedDescription)",
+                    launcher: launcher
+                ))
+                reply(peer, to: message, ok: false, error: "Secret source preview unavailable")
+                return
+            }
+        }
         var names: [String]?
         if case .secretNames(let globalOnly) = kind {
             switch loadStoredSecretsResult() {
@@ -4821,7 +4984,7 @@ private final class ApprovalServer: @unchecked Sendable {
         if denyRequestIfNeeded(request, signing: signing,
                                launchers: launchers,
                                callerPath: callerPath, peer: peer, message: message) { return }
-        reply(peer, to: message, ok: true, error: nil, names: names)
+        reply(peer, to: message, ok: true, error: nil, value: sourceValue, names: names)
     }
 
     private func launcherDenial(
@@ -14741,7 +14904,7 @@ private struct ApprovalPromptView: View {
             if usesTouchIDApproval {
                 HStack(alignment: .top, spacing: 12) {
                     denyButton
-                        .frame(maxWidth: 110)
+                        .frame(maxWidth: compact ? 110 : .infinity)
                     approvalInfoButton
                         .padding(.top, 4)
                     if usesEmbeddedTouchID {
@@ -15867,6 +16030,12 @@ private func runMetadataDisclosureSelfCheck() -> Int32 {
         bundleIdentifier: launcher.identifier,
         requirement: requirement
     )
+    guard !metadataDisclosureHasAutomaticAccess(
+        .secretSources,
+        launchers: [launcher],
+        secretNameAccessApps: [grant],
+        authorizationHistoryAccessApps: [grant]
+    ) else { return 1 }
     guard metadataDisclosureHasAutomaticAccess(
         .secretNames(globalOnly: false),
         launchers: [launcher],
@@ -20407,7 +20576,7 @@ private func runMenuStatusSelfCheck() -> Int32 {
           AutomaticApprovalFeedback.allCases == [.notification, .menuBarFlash, .none],
           automaticApprovalFeedback(rawValue: nil) == .notification,
           automaticApprovalFeedback(rawValue: "notification") == .notification,
-          automaticApprovalFeedback(rawValue: "menuBarFlash") == .menuBarFlash,
+          automaticApprovalFeedback(rawValue: "menu-bar-flash") == .menuBarFlash,
           automaticApprovalFeedback(rawValue: "none") == .none,
           automaticApprovalFeedback(rawValue: "tampered") == .notification,
           automaticAccessToastCommand(groupedMenuRecords[0].record.displayCommand, compact: true)

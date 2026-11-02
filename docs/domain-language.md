@@ -353,6 +353,14 @@ Authorization policy names the Secret, not an individual Value. A rule that
 authorizes a Secret Name therefore covers every current and future Value of that
 Secret Name.
 
+### Secret Name Access
+
+A durable grant allowing one exact Verified Launcher to list saved Secret Names.
+It does not permit disclosure of selected Value sources or Project Directories.
+`av list` source previews require separate Approval each time and never return
+Secret bytes. A preview is selection metadata, not authority or a guarantee that
+a subsequent Secret Use will succeed.
+
 ### Secret Value
 
 The opaque bytes selected when a Secret is used. A Secret may have one Global
@@ -545,6 +553,16 @@ touch approves that request once. The user may disable this presentation to
 require a click before the system Touch ID prompt starts. This independent
 Keychain-protected preference does not enable Touch ID Approval or grant
 broader authority.
+
+### Presentation settings
+
+Presentation settings control layout and security feedback, not Developer
+Authority. Compact notifications are cosmetic and directly writable. Automic
+authorization feedback and persistent grant-strip auto-collapse are protected
+visibility controls: changing either requires human Approval and a verified
+Authorization Record. Their Keychain-backed values cannot be overridden through
+UserDefaults. Missing or unreadable values keep feedback and grants visible.
+See [ADR 0076](adr/0076-cli-presentation-settings.md).
 
 ### Authorization Decision
 

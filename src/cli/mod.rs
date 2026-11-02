@@ -31,6 +31,7 @@ pub(crate) mod rclone_password;
 mod report;
 mod save;
 mod scan;
+mod settings;
 mod shell_secrets;
 pub(crate) mod sqlcmd_credential;
 mod ssh_agent;
@@ -56,8 +57,9 @@ commands:
   $ av inject --mode=fd +KEY:FD -- <cmd>  # apply secrets through anonymous pipes
   $ av proxy +KEY... [--] <command>       # proxy secret references for a command
   $ av git <clone|fetch|pull|push> <URL>  # protected GitHub HTTPS, main branch
-  $ av list                               # list saved secret names
+  $ av list [options]                     # list Secret Names; --json adds sources
   $ av history [--json] [--since 7d] [--no-pager]
+  $ av settings <list|get|set> [--json]   # inspect or tune presentation
   $ av save [options] KEY                 # store a global or Project Value
   $ av harden <tool> [-y|--yes]           # harden a tool; migrate credentials
   $ av harden gh --without-git-configuration
@@ -72,7 +74,7 @@ modes:
 more:
   $ open https://www.automicvault.com/docs/";
 
-pub(crate) const INSTALL_REVISION: u32 = 70;
+pub(crate) const INSTALL_REVISION: u32 = 74;
 
 pub(crate) fn bash_shell_secret_insecurity_reasons() -> Result<Vec<String>, String> {
     shell_secrets::bash_reasons()
@@ -552,10 +554,16 @@ where
                 let result = hardeners::codex::run(&mut stdout, yes);
                 return finish_hardening(result, "codex", &mut stdout, stderr);
             }
-            if target == "sudo" {
-                return match hardeners::sudo::run(&mut stdout, false) {
+            if target == "sudo" || target == "emudhra" {
+                let name = target.to_str().unwrap();
+                let result = if name == "sudo" {
+                    hardeners::sudo::run(&mut stdout, false)
+                } else {
+                    hardeners::emudhra::run(&mut stdout, false)
+                };
+                return match result {
                     Ok(hardeners::RootOnlyOutcome::Hardened) => {
-                        print_hardening_followup(&mut stdout, "sudo");
+                        print_hardening_followup(&mut stdout, name);
                         0
                     }
                     Ok(hardeners::RootOnlyOutcome::Previewed) => 1,
@@ -614,8 +622,9 @@ where
         Some("railway-credential") => railway_credential::run(rest, stdout, stderr),
         Some("wakatime-credential") => wakatime_credential::run(rest, stdout, stderr),
         Some("rclone-password") => rclone_password::run(rest, stdout, stderr),
-        Some("list" | "ls") => list::run(rest, stdout, stderr),
+        Some("list" | "ls") => list::run(rest, stdout, stderr, terminal),
         Some("history") => history::run(rest, stdout, stderr, terminal),
+        Some("settings") => settings::run(rest, stdout, stderr),
         Some("bless") => bless::run(rest, stderr),
         Some("open") => {
             let Some(secret_gate) = parse_open_args(&rest) else {
@@ -669,7 +678,11 @@ fn write_help(stdout: &mut dyn Write, style: scan::Style) {
 }
 
 fn print_hardening_followup(stdout: &mut dyn Write, target: &str) {
-    let _ = writeln!(stdout, "◇ next: run `av doctor {target}`");
+    if matches!(target, "sudo" | "emudhra") {
+        let _ = writeln!(stdout, "◇ next: run `av scan`");
+    } else {
+        let _ = writeln!(stdout, "◇ next: run `av doctor {target}`");
+    }
 }
 
 fn finish_hardening<W: Write + ?Sized, E: Write>(
@@ -1001,6 +1014,50 @@ mod tests {
             "╭─ harden sudo\n│\n├─ enable biometric authentication for sudo\n╰─ next: sudo av harden sudo\n"
         );
         assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn hardening_followup_recommends_the_available_check() {
+        for (target, command) in [
+            ("emudhra", "av scan"),
+            ("sudo", "av scan"),
+            ("gh", "av doctor gh"),
+            ("codex", "av doctor codex"),
+        ] {
+            let mut stdout = Vec::new();
+            print_hardening_followup(&mut stdout, target);
+            assert_eq!(
+                String::from_utf8(stdout).unwrap(),
+                format!("◇ next: run `{command}`\n"),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn harden_emudhra_previews_the_privileged_step() {
+        let _guard = crate::global_test_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!("av-cli-emudhra-{}", std::process::id()));
+        let input = concat!(
+            include_str!("../isotopes/detectors/emudhra/testdata/unaffected.pem"),
+            include_str!("../isotopes/detectors/emudhra/testdata/emsign.pem")
+        );
+        std::fs::write(&path, input).unwrap();
+        unsafe {
+            std::env::set_var("AUTOMIC_VAULT_TEST_EMUDHRA_CERT_PATH", &path);
+            std::env::set_var("AUTOMIC_VAULT_TEST_EUID", "501");
+        }
+        let (code, stdout, stderr) = run_args(&["av", "harden", "emudhra"]);
+        unsafe {
+            std::env::remove_var("AUTOMIC_VAULT_TEST_EMUDHRA_CERT_PATH");
+            std::env::remove_var("AUTOMIC_VAULT_TEST_EUID");
+        }
+        let unchanged = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(code, 1);
+        assert!(stdout.contains("sudo av harden emudhra"));
+        assert_eq!(stderr, "");
+        assert_eq!(unchanged, input);
     }
 
     #[test]

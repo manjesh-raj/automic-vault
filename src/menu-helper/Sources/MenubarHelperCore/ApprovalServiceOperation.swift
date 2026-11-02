@@ -66,7 +66,11 @@ public enum ApprovalServiceOperation: String, CaseIterable, Sendable {
     case sqlcmdDelete = "sqlcmd-delete"
     case terraformSave = "terraform-save"
     case terraformDelete = "terraform-delete"
+    case settingsList = "settings-list"
+    case settingsGet = "settings-get"
+    case settingsSet = "settings-set"
     case list
+    case listSources = "list-sources"
     case history
     case historyWindow = "history-window"
     case historyRead = "history-read"
@@ -84,7 +88,7 @@ public enum ApprovalServiceOperation: String, CaseIterable, Sendable {
     case stripeDelete = "stripe-delete"
 
     public var disclosesProtectedMetadata: Bool {
-        self == .list || self == .history || self == .historyWindow
+        self == .list || self == .listSources || self == .history || self == .historyWindow
             || self == .historyRead || self == .historyNext
     }
 }
