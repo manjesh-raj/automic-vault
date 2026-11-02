@@ -211,6 +211,27 @@ complete forensic log.
 
 [Authorization History and its limits](docs/authorization.md#authorization-history)
 
+## Presentation settings
+
+```sh
+$ av settings list --json
+$ av settings get compact-notifications
+$ av settings set compact-notifications true
+$ av settings set automatic-authorization-feedback menu-bar-flash
+$ av settings set auto-collapse-grant-strip true
+```
+
+The running app returns accepted values, defaults, and whether changes require
+Approval. Compact notifications are directly writable. Changing feedback or
+grant-strip auto-collapse requires Approval with the old and new values.
+`--json` works with every subcommand and returns an array; values are strings.
+Authorization policies and Approval methods remain in the app's Settings.
+
+These visibility preferences now use protected Keychain storage. On upgrade,
+feedback returns to notifications and grant strips stay expanded. Choose your
+preferred settings again in the app or through `av settings`; legacy `defaults`
+values no longer control them. See [the security decision](docs/adr/0076-cli-presentation-settings.md).
+
 ## Verified Launchers
 
 Choose which terminals, IDEs, agents, or eligible standalone CLIs receive
@@ -503,6 +524,37 @@ Vault's scope and roadmap. These apps cover those needs:
   execution alongside Automic Vault's Secret Custody and Authorization Gates.
   Those restrictions address local actions, such as deleting files, that need
   no protected Secret and may never reach an Automic Vault gate.
+
+&nbsp;
+
+
+## Agent Skills
+
+Teach your coding agent to write reviewed automation:
+
+- [`blessed-script`](skills/blessed-script/SKILL.md): write a Blessed Script
+  with the Secrets and Capabilities it needs, then request your review.
+- [`reentrant-blessed-script`](skills/reentrant-blessed-script/SKILL.md): write
+  or follow a script that pauses for agent input and continues when invoked again.
+
+Install with [skills](https://skills.sh):
+
+```sh
+$ npx skills add automic-vault/automic-vault
+```
+
+Select your coding agent and both skills: `reentrant-blessed-script` requires
+`blessed-script`. Then ask:
+
+> Use the blessed-script skill to write a release script for this project.
+
+Or, for a workflow that needs generated release notes:
+
+> Use the reentrant-blessed-script skill to write a release script that pauses
+> for you to draft the notes, then continues publication.
+
+The agent prepares the script and runs `av bless`; you review the script and
+requested authority in Automic Vault. Installing a skill grants no authority.
 
 &nbsp;
 

@@ -157,8 +157,44 @@ pub(crate) fn list_secret_names() -> Result<Vec<String>, String> {
     list_secret_names_filtered(false)
 }
 
+/// The service returns only source metadata, never Secret bytes.
+pub(crate) fn list_secret_sources(directory: &str) -> Result<String, String> {
+    xpc_request(
+        "list-sources",
+        Some((b"cwd\0", directory)),
+        None,
+        None,
+        None,
+    )
+    .map_err(|error| {
+        if error == "invalid XPC operation" {
+            "Secret source previews require an updated running Automic Vault app".into()
+        } else {
+            error
+        }
+    })?
+    .value
+    .ok_or_else(|| "the approval service returned no Secret source preview".into())
+}
+
 pub(crate) fn list_global_secret_names() -> Result<Vec<String>, String> {
     list_secret_names_filtered(true)
+}
+
+pub(crate) fn settings(
+    operation: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+) -> Result<String, String> {
+    xpc_request(
+        operation,
+        key.map(|v| (b"key\0" as &'static [u8], v)),
+        value.map(|v| (b"value\0" as &'static [u8], v)),
+        None,
+        None,
+    )?
+    .value
+    .ok_or_else(|| "the approval service returned no settings".into())
 }
 
 pub(crate) fn authorization_history(since: Option<u64>) -> Result<String, String> {
@@ -1181,6 +1217,7 @@ fn xpc_operation_requires_cwd(operation: &str) -> bool {
     matches!(
         operation,
         "save"
+            | "settings-set"
             | "save-if-absent"
             | "docker-save"
             | "docker-delete"
