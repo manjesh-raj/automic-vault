@@ -303,12 +303,50 @@ private struct DashboardActivityIndex {
 }
 
 @MainActor
+struct DashboardLoaders {
+    var cli: () async -> CLIInstallState = {
+        await Task.detached(priority: .background) { currentCLIInstallState() }.value
+    }
+    var tools: () async -> (ToolStatusSnapshot, [DetectorMetadata]) = {
+        await Task.detached(priority: .background) {
+            let url = defaultAVExecutableURL()
+            return (loadToolStatusSnapshot(avExecutableURL: url), loadDetectorMetadata(avExecutableURL: url))
+        }.value
+    }
+    var authorization: () async -> DashboardSnapshot = {
+        await Task.detached(priority: .background) { DashboardSnapshot.loadAuthorization() }.value
+    }
+    var launcherBundles: () async -> [LauncherBundleEnrollment] = {
+        await Task.detached(priority: .background) { loadLauncherBundleEnrollments() }.value
+    }
+    var history: (AuthorizationHistoryDashboard?) async -> AuthorizationHistoryDashboard? = { previous in
+        await Task.detached(priority: .background) { loadAuthorizationHistoryDashboard(previous: previous) }.value
+    }
+    var update: (String) async throws -> Bool = { try await runCLIInstallerScript($0) }
+}
+
+@MainActor
 final class DashboardModel: ObservableObject {
     @Published var selectedSection: DashboardSection = .overview
     @Published private(set) var snapshot = DashboardSnapshot.empty
     @Published private(set) var hasLoadedInitialSnapshot = false
-    @Published private(set) var isReloading = false
+    private let loaders: DashboardLoaders
+    private enum RefreshPart: Hashable { case cli, tools, authorization, launcherBundles }
+    @Published private var refreshTasks: [RefreshPart: Task<Void, Never>] = [:]
+    private var pendingRefreshes: Set<RefreshPart> = []
+    var isReloading: Bool { !refreshTasks.isEmpty || isRefreshingHistory }
+
+    var isRefreshingSelectedSection: Bool {
+        switch selectedSection {
+        case .hardenedTools, .doctor, .detectors: refreshTasks[.tools] != nil
+        case .secretUsage: isRefreshingHistory
+        case .launcherBundles: refreshTasks[.launcherBundles] != nil
+        case .overview: isReloading
+        default: refreshTasks[.authorization] != nil
+        }
+    }
     @Published private(set) var isUpdatingTools = false
+    private var toolUpdateTask: Task<Void, Never>?
     @Published var toolUpdateError: String?
     @Published var toolUpdateMessage: String?
     @Published var isAddingSecret = false
@@ -348,7 +386,6 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var isDiscoveringLauncherHelpers = false
     @Published private(set) var pendingLauncherHelperReview: LauncherHelperReview?
 
-    private var reloadTask: Task<Void, Never>?
     @Published private var accessRequestsReloadTask: Task<Void, Never>?
     private var accessRequestsReloadPending = false
     private var historyDashboard: AuthorizationHistoryDashboard?
@@ -358,14 +395,15 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var isLoadingOlderHistory = false
     @Published private(set) var historyLoadFailed = false
     private var pendingAccessRequestID: UUID?
-    private var reloadPending = false
     private var selectScriptNeedingReblessing = false
     private var launcherHelperDiscoveryTask: Task<Void, Never>?
     let authorityApproval = AuthorityApprovalState()
 
     private var blessingCompletion: ((BlessedScriptReviewOutcome) -> Void)?
 
-    init(snapshot: DashboardSnapshot? = nil, cliInstallState: CLIInstallState? = nil) {
+    init(snapshot: DashboardSnapshot? = nil, cliInstallState: CLIInstallState? = nil,
+         loaders: DashboardLoaders = DashboardLoaders()) {
+        self.loaders = loaders
         hasLoadedInitialSnapshot = snapshot != nil
         let snapshot = snapshot ?? .empty
         self.snapshot = snapshot
@@ -385,7 +423,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var hasSearchQuery: Bool { !searchQuery.isEmpty }
-    var isRefreshingHistory: Bool { reloadTask != nil || accessRequestsReloadTask != nil }
+    var isRefreshingHistory: Bool { accessRequestsReloadTask != nil }
 
     private func setHistoryRecords(_ records: [AccessRequestRecord], storedDayCount: Int? = nil) {
         historyRecordsByID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -679,7 +717,7 @@ final class DashboardModel: ObservableObject {
 
     var pendingAccessRequestStatus: String? {
         guard pendingAccessRequestID != nil else { return nil }
-        if reloadTask != nil || accessRequestsReloadTask != nil || isLoadingOlderHistory {
+        if accessRequestsReloadTask != nil || isLoadingOlderHistory {
             return String(localized: "Loading Authorization History…")
         }
         if historyLoadFailed {
@@ -1045,71 +1083,58 @@ final class DashboardModel: ObservableObject {
     }
 
     func updateToolStatus(_ status: ToolStatusSnapshot) {
+        guard !isUpdatingTools else { return }
         toolStatusGeneration += 1
         status.apply(to: &snapshot)
         normalizeSelection()
     }
 
     func reload() {
-        guard reloadTask == nil else {
-            reloadPending = true
+        for part in [RefreshPart.cli, .tools, .authorization, .launcherBundles] {
+            refresh(part)
+        }
+        reloadAccessRequests()
+    }
+
+    private func refresh(_ part: RefreshPart) {
+        guard refreshTasks[part] == nil else {
+            pendingRefreshes.insert(part)
             return
         }
-        accessRequestsGeneration += 1
-        isLoadingOlderHistory = false
-        let generation = accessRequestsGeneration
+        if part == .tools && isUpdatingTools { return }
+        pendingRefreshes.remove(part)
         let toolGeneration = toolStatusGeneration
-        reloadPending = false
-        isReloading = true
-        reloadTask = Task {
+        refreshTasks[part] = Task {
             defer {
-                reloadTask = nil
-                isReloading = false
-                if reloadPending { reload() }
+                refreshTasks[part] = nil
+                if pendingRefreshes.remove(part) != nil { refresh(part) }
             }
-            let cliInstallState = await Task.detached(priority: .background) {
-                currentCLIInstallState()
-            }.value
-            guard !Task.isCancelled else { return }
-            self.cliInstallState = cliInstallState
-
-            var (next, launcherBundles) = await Task.detached(priority: .background) {
-                (DashboardSnapshot.load(), loadLauncherBundleEnrollments())
-            }.value
-            guard !Task.isCancelled else { return }
-            next.detectorFindings = snapshot.detectorFindings
-            let history = await Task.detached(priority: .background) {
-                loadAuthorizationHistoryDashboard()
-            }.value
-            let page = history?.page
-            let activity = history?.activityRecords
-            guard !Task.isCancelled else { return }
-            if generation == accessRequestsGeneration {
-                historyDashboard = history
-                overviewHistory = activity
+            switch part {
+            case .cli:
+                let state = await loaders.cli()
+                guard !Task.isCancelled else { return }
+                cliInstallState = state
+            case .tools:
+                let (status, detectors) = await loaders.tools()
+                guard !Task.isCancelled, toolGeneration == toolStatusGeneration, !isUpdatingTools else { return }
+                status.apply(to: &snapshot)
+                snapshot.detectors = detectors
+                lastHardeningRefresh = Date()
+                NotificationCenter.default.post(name: dashboardDidReload, object: self)
+            case .authorization:
+                let next = await loaders.authorization()
+                guard !Task.isCancelled else { return }
+                snapshot.secretGates = next.secretGates
+                snapshot.blessedScripts = next.blessedScripts
+                snapshot.secretNameAccessApps = next.secretNameAccessApps
+                snapshot.authorizationHistoryAccessApps = next.authorizationHistoryAccessApps
+                snapshot.secrets = next.secrets
+                hasLoadedInitialSnapshot = true
+            case .launcherBundles:
+                let bundles = await loaders.launcherBundles()
+                guard !Task.isCancelled else { return }
+                launcherBundles = bundles
             }
-            next.accessRequests = generation == accessRequestsGeneration
-                ? (page?.records ?? []) : snapshot.accessRequests
-            // A menu refresh may have published newer Tool status while this load was suspended.
-            if toolGeneration != toolStatusGeneration {
-                ToolStatusSnapshot(snapshot: snapshot).apply(to: &next)
-            }
-            snapshot = next
-            lastHardeningRefresh = Date()
-            if generation == accessRequestsGeneration {
-                setHistoryRecords(next.accessRequests, storedDayCount: page?.storedDayCount)
-                historyOlderPageCursor = page?.olderPageCursor
-                isLoadingOlderHistory = false
-                historyLoadFailed = page == nil
-            }
-            if generation == accessRequestsGeneration, let id = pendingAccessRequestID {
-                if next.accessRequests.contains(where: { $0.id == id }) {
-                    resolvePendingAccessRequest(id)
-                }
-            }
-            self.launcherBundles = launcherBundles
-            hasLoadedInitialSnapshot = true
-            NotificationCenter.default.post(name: dashboardDidReload, object: self)
             normalizeSelection()
         }
     }
@@ -1128,6 +1153,7 @@ final class DashboardModel: ObservableObject {
         accessRequestsGeneration += 1
         let generation = accessRequestsGeneration
         let previous = historyDashboard
+        let loadHistory = loaders.history
         accessRequestsReloadTask = Task { [weak self] in
             defer {
                 self?.accessRequestsReloadTask = nil
@@ -1136,9 +1162,7 @@ final class DashboardModel: ObservableObject {
                     self?.reloadAccessRequests(incremental: true)
                 }
             }
-            let history = await Task.detached(priority: .background) {
-                loadAuthorizationHistoryDashboard(previous: previous)
-            }.value
+            let history = await loadHistory(previous)
             let page = history?.page
             let activity = history?.activityRecords
             guard !Task.isCancelled, let self,
@@ -1167,7 +1191,7 @@ final class DashboardModel: ObservableObject {
 
     func loadMoreHistory(retry: Bool = false) {
         guard let cursor = historyOlderPageCursor, !isLoadingOlderHistory,
-              reloadTask == nil, accessRequestsReloadTask == nil,
+              accessRequestsReloadTask == nil,
               !historyLoadFailed || retry else { return }
         isLoadingOlderHistory = true
         historyLoadFailed = false
@@ -1194,20 +1218,17 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    private func invalidateReload() {
-        // Cancellation invalidates the result, but synchronous checks still run.
-        // Retain the task until they finish so a new reload cannot overlap them.
-        reloadTask?.cancel()
-        accessRequestsReloadTask?.cancel()
-        accessRequestsGeneration += 1
-        isLoadingOlderHistory = false
-        accessRequestsReloadPending = false
-        reloadPending = false
-        isReloading = false
+    private func invalidateAuthorizationReload() {
+        // Synchronous checks cannot be stopped; discard their results and retain
+        // each task until it exits so another check cannot overlap it.
+        for part in [RefreshPart.authorization, .launcherBundles] {
+            refreshTasks[part]?.cancel()
+            pendingRefreshes.remove(part)
+        }
     }
 
     fileprivate func reloadAuthorizationState() {
-        invalidateReload()
+        invalidateAuthorizationReload()
         snapshot = reloadDashboardAuthorizationState(from: snapshot)
         launcherBundles = loadLauncherBundleEnrollments()
         normalizeSelection()
@@ -1365,6 +1386,27 @@ final class DashboardModel: ObservableObject {
         }
         errorMessage = String(localized: "Could not update \(secret.account): \(String(status))")
         return false
+    }
+
+    func setSynchronization(_ enabled: Bool, for secret: StoredSecret) {
+        let detail = secretSynchronizationWarning(enabled)
+        approveAuthorityChange(action: "secret-sync:\(secret.account)",
+            enabled ? "Enable iCloud Keychain for \(secret.account)?" : "Stop synchronizing \(secret.account)?",
+            detail: detail
+        ) { [weak self] in
+            let status = setStoredSecretSynchronization(enabled, expected: secret) {
+                let path = Bundle.main.executablePath ?? "Automic Vault"
+                return appendAccessRequestRecord(AccessRequestRecord(
+                    date: Date(), tool: "Automic Vault", command: "set-synchronization \(secret.account) \(enabled)",
+                    decision: "Approved", approvalSource: "Manual", reason: "Approved Secret synchronization change",
+                    launcher: "Automic Vault", callerPath: path, target: path, cwd: "",
+                    keys: [secret.account], detail: detail
+                ))
+            }
+            self?.errorMessage = status == errSecSuccess ? nil
+                : "Could not change iCloud Keychain synchronization: \(status). Refresh and retry."
+            self?.reloadAfterSecretMutation()
+        }
     }
 
     func chooseDirectAccessLauncher(_ completion: @escaping (DirectAccessLauncherSelection?) -> Void) {
@@ -1540,20 +1582,34 @@ final class DashboardModel: ObservableObject {
         return snapshot.packages.filter { hardened.contains($0.name) && $0.update == "Update available" }
     }
 
+    var canUpdateTools: Bool {
+        !isUpdatingTools && (cliInstallState == nil || cliInstallState == .current)
+    }
+
     func updateTools(_ names: [String]) {
-        guard !isUpdatingTools, !isReloading, cliInstallState == .current else { return }
+        guard canUpdateTools else { return }
         let eligible = Set(toolUpdates.map(\.name))
         guard !names.isEmpty, names.allSatisfy(eligible.contains),
               let script = managedPackageUpdateScript(names: names) else { return }
         isUpdatingTools = true
+        toolStatusGeneration += 1
+        refreshTasks[.tools]?.cancel()
+        refreshTasks[.cli]?.cancel()
         toolUpdateError = nil
         toolUpdateMessage = nil
-        Task {
-            defer { isUpdatingTools = false; reload() }
+        toolUpdateTask = Task {
+            defer {
+                toolUpdateTask = nil
+                isUpdatingTools = false
+                // Invalidate menu checks started before or during this mutation.
+                NotificationCenter.default.post(name: dashboardDidReload, object: self)
+                refresh(.tools)
+            }
             do {
-                let ready = await Task.detached { currentCLIInstallState() == .current }.value
-                guard ready else { throw CLIInstallerError.bundledCLIUnavailable }
-                if try await runCLIInstallerScript(script) {
+                let state = await loaders.cli()
+                cliInstallState = state
+                guard state == .current else { throw CLIInstallerError.bundledCLIUnavailable }
+                if try await loaders.update(script) {
                     toolUpdateMessage = String(localized: "Updates complete")
                 } else {
                     toolUpdateMessage = String(localized: "Update cancelled")
@@ -1843,7 +1899,7 @@ final class DashboardModel: ObservableObject {
             errorMessage = String(localized: "\(error): \(String(status))")
             return
         }
-        invalidateReload()
+        invalidateAuthorizationReload()
         guard let index = snapshot.secretGates.firstIndex(where: { $0.id == gate.id }) else {
             errorMessage = String(localized: "The policy was saved, but the Authorization Gate is no longer available")
             return
@@ -2398,6 +2454,187 @@ func runUpdateToolbarSelfCheck() -> Int32 {
     controller.setAvailableUpdateVersion(nil, checkedAt: checked)
     return controller.rootView.model.availableUpdateVersion == nil
         && controller.rootView.model.lastUpdateCheck == checked ? 0 : 1
+}
+
+// Controlled suspension keeps these race checks independent of disk, Keychain,
+// network timing, and administrator prompts.
+@MainActor
+private final class DashboardRefreshLatch {
+    private var opened = false
+    private var didStart = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    private var started: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        didStart = true
+        started.forEach { $0.resume() }
+        started.removeAll()
+        if !opened { await withCheckedContinuation { waiting.append($0) } }
+    }
+
+    func waitUntilStarted() async {
+        if !didStart { await withCheckedContinuation { started.append($0) } }
+    }
+
+    func open() {
+        opened = true
+        waiting.forEach { $0.resume() }
+        waiting.removeAll()
+    }
+}
+
+extension DashboardModel {
+    static func refreshSelfCheck() async -> Int32 {
+        var fixture = DashboardSnapshot.empty
+        fixture.hardenedTools = [HardenedTool(name: "aws", targetPath: "/fixture/aws")]
+        fixture.packages = try! JSONDecoder().decode([PackageStatus].self, from: Data(
+            #"[{"name":"aws","installation":"Installed","update":"Update available","detail":"Fixture","target_path":"/fixture/aws"}]"#.utf8))
+        let cli = DashboardRefreshLatch()
+        let tools = DashboardRefreshLatch()
+        let authorization = DashboardRefreshLatch()
+        let history = DashboardRefreshLatch()
+        let updater = DashboardRefreshLatch()
+        var cliLoads = 0
+        var toolLoads = 0
+        var updateCalls = 0
+        var loaders = DashboardLoaders()
+        loaders.cli = {
+            cliLoads += 1
+            if cliLoads == 1 { await cli.wait(); return .outdated }
+            return .current
+        }
+        loaders.tools = {
+            toolLoads += 1
+            await tools.wait()
+            return (ToolStatusSnapshot(snapshot: .empty), [])
+        }
+        loaders.authorization = {
+            await authorization.wait()
+            return .empty
+        }
+        loaders.launcherBundles = { [] }
+        loaders.history = { _ in await history.wait(); return nil }
+        loaders.update = { _ in
+            updateCalls += 1
+            await updater.wait()
+            return true
+        }
+        let model = DashboardModel(loaders: loaders)
+        model.updateToolStatus(ToolStatusSnapshot(snapshot: fixture))
+        model.selectSection(.hardenedTools)
+        guard model.canUpdateTools, model.toolUpdates.count == 1 else {
+            print("Menu Tool status must be actionable before the initial CLI check")
+            return 1
+        }
+        model.reload()
+        await cli.waitUntilStarted()
+        await tools.waitUntilStarted()
+        await authorization.waitUntilStarted()
+        await history.waitUntilStarted()
+        let oldCLI = model.refreshTasks[.cli]!
+        let oldTools = model.refreshTasks[.tools]!
+        let oldAuthorization = model.refreshTasks[.authorization]!
+        let historyTask = model.accessRequestsReloadTask!
+        guard model.isReloading, model.isRefreshingHistory, model.canUpdateTools else { return 1 }
+        // Repeated requests coalesce without concurrent checks for the same part.
+        model.refresh(.tools)
+        model.refresh(.tools)
+        model.updateTools(["aws"])
+        let updateTask = model.toolUpdateTask!
+        await updater.waitUntilStarted()
+        cli.open()
+        await oldCLI.value
+        guard model.cliInstallState == .current else {
+            print("An older CLI refresh overwrote the update preflight")
+            return 1
+        }
+        model.updateTools(["aws"])
+        model.updateToolStatus(ToolStatusSnapshot(snapshot: .empty))
+        guard updateCalls == 1, !model.canUpdateTools, model.toolUpdates.count == 1 else { return 1 }
+        model.invalidateAuthorizationReload()
+        let launcher = BlessedScriptLauncher(bundleIdentifier: "fixture.new", requirement: "fixture.new")
+        model.snapshot.secretNameAccessApps = [launcher]
+        tools.open()
+        await oldTools.value
+        guard model.toolUpdates.count == 1, toolLoads == 1 else {
+            print("A pre-update refresh replaced Tool status during the update")
+            return 1
+        }
+        updater.open()
+        await updateTask.value
+        if let task = model.refreshTasks[.tools] { await task.value }
+        guard toolLoads == 2, model.toolUpdates.isEmpty,
+              model.toolUpdateMessage == String(localized: "Updates complete"),
+              model.isRefreshingHistory, !model.isRefreshingSelectedSection else {
+            print("Tool updates must finish independently of authorization and history")
+            return 1
+        }
+        authorization.open()
+        await oldAuthorization.value
+        guard model.snapshot.secretNameAccessApps == [launcher], model.toolUpdates.isEmpty else {
+            print("An obsolete authorization load overwrote a newer mutation")
+            return 1
+        }
+        history.open()
+        await historyTask.value
+        guard model.historyLoadFailed, !model.isRefreshingHistory else { return 1 }
+
+        // A refresh burst produces one follow-up, with no overlapping work.
+        let burst = DashboardRefreshLatch()
+        var burstLoads = 0
+        loaders.authorization = {
+            burstLoads += 1
+            await burst.wait()
+            return .empty
+        }
+        let burstModel = DashboardModel(loaders: loaders)
+        burstModel.refresh(.authorization)
+        await burst.waitUntilStarted()
+        let first = burstModel.refreshTasks[.authorization]!
+        for _ in 0..<100 { burstModel.refresh(.authorization) }
+        guard burstLoads == 1, !first.isCancelled else { return 1 }
+        burst.open()
+        await first.value
+        if let second = burstModel.refreshTasks[.authorization] { await second.value }
+        guard burstLoads == 2, burstModel.hasLoadedInitialSnapshot, !burstModel.isReloading else { return 1 }
+
+        // A newer menu result wins over an older dashboard check.
+        let menuRace = DashboardRefreshLatch()
+        loaders.tools = { await menuRace.wait(); return (ToolStatusSnapshot(snapshot: .empty), []) }
+        let menuModel = DashboardModel(loaders: loaders)
+        menuModel.refresh(.tools)
+        let menuTask = menuModel.refreshTasks[.tools]!
+        await menuRace.waitUntilStarted()
+        menuModel.updateToolStatus(ToolStatusSnapshot(snapshot: fixture))
+        menuRace.open()
+        await menuTask.value
+        guard menuModel.toolUpdates.count == 1 else { return 1 }
+
+        // Unknown CLI state accepts intent, but missing or invalid CLI never executes.
+        for state in [CLIInstallState.missing, .outdated] {
+            loaders.cli = { state }
+            loaders.tools = { (ToolStatusSnapshot(snapshot: fixture), []) }
+            let blocked = DashboardModel(snapshot: fixture, loaders: loaders)
+            blocked.updateTools(["aws"])
+            await blocked.toolUpdateTask?.value
+            guard updateCalls == 1, blocked.toolUpdateError != nil,
+                  !blocked.canUpdateTools, blocked.cliInstallState == state else { return 1 }
+        }
+        loaders.cli = { .current }
+        loaders.update = { _ in false }
+        let cancelled = DashboardModel(snapshot: fixture, loaders: loaders)
+        cancelled.updateTools(["aws"])
+        await cancelled.toolUpdateTask?.value
+        guard cancelled.canUpdateTools,
+              cancelled.toolUpdateMessage == String(localized: "Update cancelled") else { return 1 }
+        loaders.update = { _ in throw CLIInstallerError.bundledCLIUnavailable }
+        let failed = DashboardModel(snapshot: fixture, loaders: loaders)
+        failed.updateTools(["aws"])
+        await failed.toolUpdateTask?.value
+        guard failed.canUpdateTools, failed.toolUpdateError != nil else { return 1 }
+        print("Dashboard scoped refresh self-check passed")
+        return 0
+    }
 }
 
 @MainActor
@@ -3483,6 +3720,9 @@ struct DashboardRootView: View {
                 .labelStyle(.titleAndIcon)
                 .help("\(cliActionTitle) at /usr/local/bin/av")
             }
+            if #available(macOS 26, *) {
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+            }
         }
     }
 
@@ -3494,8 +3734,7 @@ struct DashboardRootView: View {
             } label: {
                 Label("Update", systemImage: "arrow.down.circle")
             }
-            .disabled(model.selectedToolPackage?.update != "Update available" || model.isUpdatingTools
-                || model.isReloading || model.cliInstallState != .current)
+            .disabled(model.selectedToolPackage?.update != "Update available" || !model.canUpdateTools)
             .labelStyle(.titleAndIcon)
             .help("Update this managed Tool")
         }
@@ -3569,8 +3808,7 @@ struct DashboardRootView: View {
     private var listActions: some View {
         if model.selectedSection == .hardenedTools {
             Button("Update All") { model.updateTools(model.toolUpdates.map(\.name)) }
-                .disabled(model.toolUpdates.isEmpty || model.isUpdatingTools
-                    || model.isReloading || model.cliInstallState != .current)
+                .disabled(model.toolUpdates.isEmpty || !model.canUpdateTools)
         }
         if model.selectedSection == .allSecrets {
             Button { model.isAddingSecret = true } label: {
@@ -3632,8 +3870,8 @@ struct DashboardRootView: View {
                         .navigationSplitViewColumnWidth(min: 186, ideal: 227, max: 250)
                 } detail: {
                     DashboardOverviewView(model: model, checkForUpdates: checkForUpdates)
-                        .toolbar { cliInstallToolbar }
                         .toolbar {
+                            cliInstallToolbar
                             ToolbarItem(placement: .primaryAction) {
                                 Button {
                                     requestScan()
@@ -3654,9 +3892,9 @@ struct DashboardRootView: View {
                 .navigationSplitViewColumnWidth(min: 168, ideal: 255)
         } detail: {
             DashboardDetailView(model: model)
-                .toolbar { cliInstallToolbar }
                 .navigationSplitViewColumnWidth(min: 320, ideal: 320)
                 .toolbar {
+                    cliInstallToolbar
                     ToolbarItemGroup(placement: .primaryAction) {
                         Spacer()
                         if let version = model.availableUpdateVersion {
@@ -3796,7 +4034,12 @@ private struct DashboardSidebarView: View {
             Spacer(minLength: 0)
             let count = model.count(for: section)
             let reblessingCount = section == .blessedScripts ? model.scriptsNeedingReblessingCount : 0
-            if section == .secretUsage, model.authorizationHistoryDayCount > 0 {
+            if section == .hardenedTools, model.isUpdatingTools {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("Updating Tools…")
+                    .accessibilityLabel("Updating Tools…")
+            } else if section == .secretUsage, model.authorizationHistoryDayCount > 0 {
                 SidebarCountText(text: "\(model.authorizationHistoryDayCount)d")
                     .fixedSize()
             } else if count > 0 {
@@ -3873,7 +4116,7 @@ private struct DashboardListView: View {
                             Button("Load Older Records") { model.loadMoreHistory(retry: true) }
                         }
                     }
-                    if model.isReloading && model.selectedSection != .secretUsage {
+                    if model.isRefreshingSelectedSection && model.selectedSection != .secretUsage {
                         ProgressView()
                             .controlSize(.large)
                     }
@@ -3885,17 +4128,15 @@ private struct DashboardListView: View {
         }
         .safeAreaInset(edge: .bottom) {
             if model.selectedSection == .hardenedTools,
-               model.toolUpdateError != nil || model.isUpdatingTools || model.toolUpdateMessage != nil
-                || (!model.toolUpdates.isEmpty && model.cliInstallState != .current) {
+               model.toolUpdateError != nil || model.toolUpdateMessage != nil
+                || (!model.toolUpdates.isEmpty && model.cliInstallState != nil && model.cliInstallState != .current) {
                 VStack(alignment: .leading, spacing: 8) {
                     if let error = model.toolUpdateError {
                         Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                    } else if model.isUpdatingTools {
-                        ProgressView("Updating Tools…").controlSize(.small)
                     } else if let message = model.toolUpdateMessage {
                         Text(message).font(.caption).foregroundStyle(.secondary)
                     }
-                    if !model.toolUpdates.isEmpty && model.cliInstallState != .current {
+                    if !model.toolUpdates.isEmpty && model.cliInstallState != nil && model.cliInstallState != .current {
                         Text("Install the current av CLI to update Tools.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -4711,6 +4952,7 @@ private struct StoredSecretDetailView: View {
     @State private var replacingValue: StoredSecretValue?
     @State private var deletingValue: StoredSecretValue?
     @State private var pendingAccessibility: StoredSecretAccessibility?
+    @State private var pendingSynchronization: StoredSecret?
 
     init(model: DashboardModel, secret: StoredSecret) {
         self.model = model
@@ -4788,6 +5030,24 @@ private struct StoredSecretDetailView: View {
                     .fill(Color(nsColor: .controlBackgroundColor))
             }
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("iCloud Keychain")
+                    .font(.headline)
+                Text(secret.hasConsistentSynchronization
+                     ? (secret.synchronizable ? "Synchronization enabled" : "Local-only")
+                     : "Synchronization settings differ between Values")
+                Text("Requires iCloud Keychain on your Macs. Changes and deletions may reach other devices; synchronization is eventual. Authorization remains local. This is a setting, not confirmation that another Mac has received the Values.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                AuthorityApprovalButton(title: secret.synchronizable ? "Stop Synchronizing…" : "Enable Synchronization…",
+                    approval: model.authorityApproval, action: "secret-sync:\(secret.account)") {
+                    pendingSynchronization = secret
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+
             VStack(alignment: .leading, spacing: 10) {
                 launcherList(
                     secret.directAccessLaunchers,
@@ -4826,6 +5086,20 @@ private struct StoredSecretDetailView: View {
         .onChange(of: secret.accessibility) { _, accessibility in
             isAvailableWhileLocked = accessibility.isAvailableWhileLocked
         }
+        .alert("Change iCloud Keychain synchronization?", isPresented: Binding(
+            get: { pendingSynchronization != nil },
+            set: { if !$0 { pendingSynchronization = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { pendingSynchronization = nil }
+            Button("Change All Values") {
+                guard let reviewed = pendingSynchronization else { return }
+                pendingSynchronization = nil
+                model.setSynchronization(!reviewed.synchronizable, for: reviewed)
+            }
+        } message: {
+            Text(secretSynchronizationWarning(!(pendingSynchronization ?? secret).synchronizable))
+        }
+        .onDisappear { model.authorityApproval.cancel("secret-sync:\(secret.account)") }
         .alert("Change availability for all Values?", isPresented: Binding(
             get: { pendingAccessibility != nil },
             set: { if !$0 { pendingAccessibility = nil } }

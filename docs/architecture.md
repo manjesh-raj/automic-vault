@@ -4,6 +4,11 @@ Automic Vault is a local authority system for developer credentials and controll
 
 The [domain language](domain-language.md) is authoritative. The ADRs in [`docs/adr`](adr) record the decisions behind this architecture.
 
+This document describes shipped av4 behavior. The av5 rewrite's explicit
+departures are scoped in [ADR 0081](adr/0081-av5-versioned-security-boundaries.md).
+In particular, av5 removes persistent authorization recording and adds companion
+Macs without moving enforcement off the originating Mac. av4 is unchanged.
+
 ## Principles
 
 ### The Mac enforces authority
@@ -55,6 +60,13 @@ text, keyed by its registered name. The catalog is embedded in the executable.
 Detector Markdown is presentation-only; changing its headings or formatting
 cannot change monitoring coverage or machine-readable remediation.
 
+PATH Findings recognize narrowly validated command directories inside installed
+vendor applications, relying on macOS App Management rather than Unix write
+permissions alone. The app executable and every file in the command directory
+must validate; uncertain cases retain the Finding. This diagnostic exception
+grants no authority and does not certify unrelated bundle resources. See
+[ADR 0078](adr/0078-sealed-application-path-directories.md).
+
 ### Tool Hardening
 
 Hardeners move supported Tools into a declared Hardened State. Doctor verifies
@@ -98,6 +110,16 @@ revalidate the installed artifact before Secret Application and execution; this
 is pre-execution verification, not a live credential-provider handshake. See
 [ADR 0059](adr/0059-hcloud-verified-vendor-target.md).
 
+The gcloud Isotope embeds a pinned Python runtime and SDK in a signed,
+root-owned bundle. Its native entry point is both Gate Client and Target;
+ordinary Python interpreters cannot access its custody operations. User OAuth
+login, credential loading, refresh-token replacement, and logout use AV custody.
+Access tokens remain in memory, and legacy credential-file generation and ADC
+export are disabled. Global Values only are supported; every read initially
+classifies as Unknown. Conditional mutations reject stale refresh and logout
+requests. The supported scope and release validation are specified in
+[ADR 0082](adr/0082-gcloud-isotope-custody.md).
+
 Hardener detection is point-in-time diagnostic state, not runtime authorization
 evidence. Runtime Authorization consumes static Gate definitions and performs
 the required live identity, integrity, request, policy, and recording checks at
@@ -132,8 +154,11 @@ operation. See [ADR 0032](adr/0032-positive-secret-routing.md).
 
 Automic Vault stores named opaque Secrets in the macOS Data Protection
 Keychain. A Secret may contain a Global Value and Project Values. Each Secret
-has one availability choice, shared by all its Values and independent of
-authorization policy.
+has one availability choice and one off-by-default synchronization choice,
+shared by all its Values and independent of authorization policy. Optional
+[Secret Synchronization](domain-language.md#secret-synchronization) expands
+custody to iCloud Keychain and the user's trusted devices. See
+[ADR 0077](adr/0077-optional-secret-synchronization.md).
 
 ### Secret source previews
 
@@ -741,7 +766,7 @@ Access Rules and Blessings, applies to all Values of that exact Secret Name. A
 Launcher with authority for a Secret may choose a working directory and thereby
 choose among its Values.
 
-Availability and renaming apply to every Value of a Secret. Multi-item
+Availability, synchronization, and renaming apply to every Value of a Secret. Multi-item
 mutations persist a forward-repair journal before changing Value items. The app
 resumes an interrupted operation, and affected Secret Names remain unavailable
 until repair completes. Removing one Value retains name-based policy while

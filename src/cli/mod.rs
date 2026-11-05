@@ -74,7 +74,7 @@ modes:
 more:
   $ open https://www.automicvault.com/docs/";
 
-pub(crate) const INSTALL_REVISION: u32 = 74;
+pub(crate) const INSTALL_REVISION: u32 = 77;
 
 pub(crate) fn bash_shell_secret_insecurity_reasons() -> Result<Vec<String>, String> {
     shell_secrets::bash_reasons()
@@ -533,6 +533,10 @@ where
             if target == "kubectl" || target == "kubernetes-cli" {
                 let result = hardeners::kubectl::run(&mut stdout, yes);
                 return finish_hardening(result, "kubectl", &mut stdout, stderr);
+            }
+            if target == "gcloud" {
+                let result = hardeners::gcloud::run(&mut stdout, yes);
+                return finish_hardening(result, "gcloud", &mut stdout, stderr);
             }
             if target == "wrangler" {
                 let result = hardeners::wrangler::run(&mut stdout, yes);

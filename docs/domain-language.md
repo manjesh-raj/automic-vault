@@ -3,6 +3,12 @@
 Status: authoritative
 Applies to: endorsed Automic Vault products, interfaces, and documentation
 
+Version scope: the shipped behavior described below applies to av4. The av5
+rewrite retains these terms with the explicit exceptions in
+[ADR 0081](adr/0081-av5-versioned-security-boundaries.md): no persistent
+Authorization History, companion-Mac approvals, and a smaller integration scope.
+Those exceptions do not change av4's guarantees.
+
 Automic Vault protects developer credentials at two boundaries: where they are stored and where they are used. Its domain is developer authority, with secrets and the application of those secrets at its center. Execution control, including Homebrew control, belongs to the same domain even when an operation uses no secret.
 
 This document defines the language used across the Automic Vault ecosystem. Product copy should favor the user-facing terms. Architecture and implementation may use the precise terms where the distinction affects security.
@@ -150,7 +156,7 @@ Authorization Record before release.
 
 ### Local Execution Boundary
 
-The point on the Mac where Automic Vault decides whether a Verified Launcher may apply a protected Secret or perform a gated operation through a Target. Secret storage, identity verification, policy evaluation, enforcement, and Authorization History remain on the Mac. A companion device may carry an Approval, but the Mac enforces the resulting Authorization Decision.
+The point on the Mac where Automic Vault decides whether a Verified Launcher may apply a protected Secret or perform a gated operation through a Target. Identity verification, policy evaluation, enforcement, and Authorization History remain on the Mac. Secret storage is local by default; explicit Secret Synchronization expands custody to iCloud Keychain and the user’s trusted devices. A companion device may carry an Approval, but the Mac enforces the resulting Authorization Decision.
 
 ## Participants
 
@@ -439,6 +445,20 @@ Secret bytes or sharing its descriptors after receipt.
 ### Secret Disclosure
 
 The intentional return of a raw Secret value to the Launcher, standard output, clipboard, or another general-purpose destination. `gh auth token` is a Secret Disclosure even though it has no remote side effect.
+
+### Secret Synchronization
+
+An explicit, off-by-default choice to store all Values of one Secret as
+synchronizable Data Protection Keychain items. iCloud Keychain handles eventual
+synchronization to the user's trusted devices, including updates and deletions.
+This expands Secret Custody; it does not transfer Developer Authority,
+Authorization Policy, Launcher enrollment, Approval, or Authorization History.
+Existing policy on a receiving Mac still applies to that Secret Name.
+
+The choice is shared by all Values. Newly saved Values inherit it. Project
+Directories retain their exact paths; synchronization does not create or remap
+directories. Disabling synchronization cannot revoke Values already received or
+used elsewhere. An enabled setting is not proof of delivery to another device.
 
 ### Secret Availability
 
