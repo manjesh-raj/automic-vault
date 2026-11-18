@@ -49,7 +49,7 @@ The authority to use developer credentials and perform controlled developer oper
 A boundary that decides whether an operation may proceed. Every gate owns one Authorization Policy.
 
 - A **Secret Gate** controls the application or disclosure of protected secrets.
-- An **Execution Gate** controls an operation without requiring a secret. Homebrew is the current example.
+- An **Execution Gate** controls an operation without requiring a secret. The deprecated Homebrew Hardener retains this gate for existing installations.
 
 ### Direct Secret Gate
 
@@ -744,6 +744,11 @@ protected Secret removed from its environment. That invocation makes no Secret
 Use request; it is not an Unknown operation receiving automic authorization.
 An explicit Secret Use request whose characteristics remain Unknown still
 requires Approval.
+
+The GitHub CLI Hardener protects `gh` independently of Git. Its former
+protected Git HTTPS transport (`av git` and `git-remote-av`) is deprecated and
+no longer installed. Existing transport requests retain the same Secret Use
+boundary; deprecation grants no ordinary credential-helper authority.
 
 ### Hardened State
 

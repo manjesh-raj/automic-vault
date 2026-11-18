@@ -69,6 +69,11 @@ grants no authority and does not certify unrelated bundle resources. See
 
 ### Tool Hardening
 
+The Homebrew Hardener is deprecated. Its dedicated Detector is retired; Scan
+no longer recommends Homebrew hardening. Existing installations retain their
+Execution Gate, ownership protections, Doctor checks, and explicit unharden
+path. Deprecation does not change Authorization Policy or enforcement.
+
 Hardeners move supported Tools into a declared Hardened State. Doctor verifies
 the installed intervention and its dependencies. Installed hardening detection
 does not depend on the inspecting process’s PATH; command resolution remains a
@@ -177,7 +182,10 @@ See [ADR 0075](adr/0075-cli-secret-source-previews.md).
 The protected `av git` HTTPS path registers a fixed network phase separately
 from local repository operations. Its root-owned Git configuration and exact
 live av/Git/HTTPS/gh chain narrow credential use at the existing gh Secret Gate.
-It is under validation; see [ADR 0047](adr/0047-protected-git-https-transport.md).
+It is deprecated and no longer installed. Existing transport use retains these
+checks and emits a warning; gh hardening leaves Git configuration untouched.
+See [ADR 0084](adr/0084-deprecated-git-transport.md) and the legacy boundary in
+[ADR 0047](adr/0047-protected-git-https-transport.md).
 
 Authorization Gates verify the Launcher, bind the Gate Client and Target, classify the complete operation, apply the gate's Authorization Policy, request Approval when policy cannot allow it, and enforce the Authorization Decision.
 

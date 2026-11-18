@@ -8,10 +8,11 @@ $ av harden gh
 $ av doctor gh
 ```
 
-By default, `av harden gh` also configures protected GitHub HTTPS operations,
-including fresh clones. Use `av harden gh --without-git-configuration` if you
-manage Git routing yourself. See the [gh hardener](../src/isotopes/hardeners/gh_cli.md)
-for supported operations and rollback.
+`av harden gh` protects GitHub CLI credentials and leaves Git configuration
+unchanged. The protected Git HTTPS transport is deprecated and no longer
+installed. Use [SSH with the Automic Vault SSH agent](securing-git.md) for Git;
+see the [gh hardener](../src/isotopes/hardeners/gh_cli.md) for legacy routing
+removal guidance.
 
 A Detector reports a supported Exposure or Hazard without changing the
 environment, requesting Secrets, or invoking a configured credential helper.
@@ -66,6 +67,12 @@ The Secret Gate verifies the live vendor-signed Docker process, ancestry,
 arguments, runtime posture, and requested registry. Docker's helper protocol
 returns a usable token to the authorized Docker process. A compromised Target
 can leak that token.
+
+## npm and Node version managers
+
+The npm launcher pins one Target and does not follow `nvm use`. See
+[npm launchers and Node version managers](npm-version-managers.md) before
+changing versions or trying to repair a PATH finding.
 
 ## Rescind Unneeded Terminal Permissions
 

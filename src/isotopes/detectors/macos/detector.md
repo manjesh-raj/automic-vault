@@ -1,4 +1,4 @@
-# macOS
+# Vulnerable PATH
 
 ```sh
 launchctl getenv PATH
